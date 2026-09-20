@@ -138,39 +138,46 @@ def find_optimal_grid_parameters(tile_mask):
     v_proj = np.sum(mask_edges, axis=0)
     h_proj = np.sum(mask_edges, axis=1)
 
-    best_overall_score = -1
-    best_S = 100
-    best_x0 = 0
-    best_y0 = 0
+    scores_by_S = {}
 
-    # Search tile size pitch range (80px to 140px)
-    for S in range(80, 140):
-        # 1. Best x0 offset for candidate S
+    # 1. Expanded search pitch range for individual tiles (35px to 110px)
+    for S in range(35, 110):
+        # Best x0 offset for candidate S
         best_x_score = -1
         best_x_offset = 0
         for x0 in range(S):
             x_indices = np.arange(x0, w, S)
-            score_x = np.sum(v_proj[x_indices])
-            if score_x > best_x_score:
-                best_x_score = score_x
-                best_x_offset = x0
+            if len(x_indices) > 0:
+                # Use np.mean to prevent bias caused by varying number of grid lines
+                score_x = np.mean(v_proj[x_indices])
+                if score_x > best_x_score:
+                    best_x_score = score_x
+                    best_x_offset = x0
 
-        # 2. Best y0 offset for candidate S
+        # Best y0 offset for candidate S
         best_y_score = -1
         best_y_offset = 0
         for y0 in range(S):
             y_indices = np.arange(y0, h, S)
-            score_y = np.sum(h_proj[y_indices])
-            if score_y > best_y_score:
-                best_y_score = score_y
-                best_y_offset = y0
+            if len(y_indices) > 0:
+                score_y = np.mean(h_proj[y_indices])
+                if score_y > best_y_score:
+                    best_y_score = score_y
+                    best_y_offset = y0
 
         total_score = best_x_score + best_y_score
-        if total_score > best_overall_score:
-            best_overall_score = total_score
-            best_S = S
-            best_x0 = best_x_offset
-            best_y0 = best_y_offset
+        scores_by_S[S] = (total_score, best_x_offset, best_y_offset)
+
+    # 2. Find maximum achieved score across all tile sizes
+    max_score = max(data[0] for data in scores_by_S.values())
+
+    # 3. Fundamental frequency selection: choose smallest tile size S
+    # achieving at least 85% of the peak score.
+    # Prevents selecting 2x or 3x harmonic multiples.
+    candidate_S_list = [S for S, (score, _, _) in scores_by_S.items() if score >= 0.85 * max_score]
+    best_S = min(candidate_S_list)
+    
+    _, best_x0, best_y0 = scores_by_S[best_S]
 
     return best_S, best_x0, best_y0
 
