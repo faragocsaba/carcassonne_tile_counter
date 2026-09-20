@@ -2,6 +2,8 @@
 
 An automated computer vision and deep learning pipeline designed to crop, classify, and count played Carcassonne board game tiles from Board Game Arena (BGA) screenshots. It calculates the remaining unplayed tile distribution based on the official 72-tile base set.
 
+🚀 **Live Web App Demo:** [Hugging Face Spaces](https://huggingface.co/spaces/fcsaba/carcassonne-board-analyzer)
+
 ---
 
 ## 📌 Project Overview & Architecture
@@ -11,7 +13,7 @@ The system operates in 4 main stages:
 1. **Asset Unpacking (`bga_asset_unpacker.py`)**: Slices BGA WebP spritesheet assets into individual base tiles and meeple PNGs.
 2. **Synthetic Dataset Generation (`synthetic_dataset_generator.py`)**: Generates an augmented training dataset across 24 tile classes, accounting for rotations (0°, 90°, 180°, 270°) and standing/lying meeple placements in 5 player colors.
 3. **Board Screenshot Cropping (`bga_tile_cropper.py`)**: Extracts played tiles from BGA screenshots using LAB chrominance background masking and 2D grid phase-aligned optimization.
-4. **Tile Classification & Set Analysis (`carcassonne_set_analyzer.py`)**: Predicts tile categories using a fine-tuned **ResNet18** model and calculates the remaining unplayed tile distribution.
+4. **Tile Classification & Set Analysis (`carcassonne_set_analyzer.py` / `app.py`)**: Predicts tile categories using a fine-tuned **ResNet18** model and calculates the remaining unplayed tile distribution. Interactive web interface powered by **Gradio** and deployed on **Hugging Face Spaces**.
 
 ---
 
@@ -24,27 +26,44 @@ The system operates in 4 main stages:
 ├── assets/                        # Unpacked BGA PNG assets
 │   ├── tiles/                     # Base tile templates (tile_000.png to tile_028.png)
 │   └── meeples/                   # Meeple overlays (5 colors, standing & lying)
+├── tiles/                         # Reference PNG icons per tile type (for HTML report UI)
 ├── generated_tiles/               # Synthetic dataset organized by tile code
 ├── extracted_tiles/               # Cropped tiles & reports per processed screenshot
 ├── bga_asset_unpacker.py          # Extracts PNG assets from raw BGA WebP sheets
 ├── synthetic_dataset_generator.py # Generates synthetic dataset with meeples & rotations
 ├── bga_tile_cropper.py            # Standalone grid cropper for BGA screenshots
 ├── train_tile_classifier.py       # Fine-tunes ResNet18 model on synthetic dataset
-├── carcassonne_set_analyzer.py    # Main pipeline: Cropping + AI Prediction + Report
+├── carcassonne_set_analyzer.py    # CLI batch pipeline: Cropping + AI Prediction + Report
+├── app.py                         # Interactive Gradio Web App for Hugging Face Spaces
+├── requirements.txt               # Dependencies for Hugging Face Spaces deployment
 ├── carcassonne_model.pth          # Trained PyTorch ResNet18 model weights
 └── class_names.json               # Class index to tile code mapping
 ```
 
 ---
 
-## 🚀 Quickstart Guide
+## 🌐 Web Application & Live Demo
+
+Try the interactive web interface without installing anything:
+👉 **[Carcassonne Board Analyzer on Hugging Face Spaces](https://huggingface.co/spaces/fcsaba/carcassonne-board-analyzer)**
+
+To run the Gradio app locally:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+---
+
+## 🚀 Quickstart Guide (CLI)
 
 ### 1. Installation
 
 Install the required Python dependencies:
 
 ```bash
-pip install torch torchvision pillow opencv-python numpy
+pip install torch torchvision pillow opencv-python numpy huggingface_hub gradio
 ```
 
 ### 2. Asset Extraction & Dataset Generation
@@ -81,49 +100,13 @@ python carcassonne_set_analyzer.py
 
 ## 📊 Output Example
 
-For each analyzed screenshot, a dedicated subdirectory is created in `extracted_tiles/` containing:
+The Gradio Web App (`app.py`) displays an interactive HTML table with embedded tile icons, played counts, canonical set totals, and remaining unplayed tile counts.
+
+For batch processing via CLI (`carcassonne_set_analyzer.py`), a dedicated subdirectory is created in `extracted_tiles/` per screenshot containing:
 - `grid_detection_preview.jpg`: Verification image showing green grid bounding boxes around detected tiles.
 - `debug_clean_board_mask.png`: Binary mask used for grid fitting.
 - `analysis_report.txt`: Text summary comparing played vs. remaining counts.
 - Subdirectories per tile category containing categorized tile crops.
-
-### Sample Report (`analysis_report.txt`)
-
-```text
-===============================================================================
- CARCASSONNE TILE COUNT ANALYSIS REPORT
- Source Image: own_party1.jpg
-===============================================================================
-TILE_CODE    | PLAYED | SET_TOTAL | REMAINING
--------------------------------------------------
-CCCCS        |      0 |         1 |         1
-RRRR         |      0 |         1 |         1
-CCCF         |      1 |         3 |         2
-CCCFS        |      0 |         1 |         1
-CCCR         |      0 |         1 |         1
-CCCRS        |      0 |         2 |         2
-RRRF         |      0 |         4 |         4
-CFCF         |      0 |         1 |         1
-CFCFS        |      0 |         2 |         2
-RFRF         |      1 |         8 |         7
-CCFF         |      0 |         3 |         3
-CCFFS        |      0 |         2 |         2
-CCRR         |      0 |         3 |         3
-CCRRS        |      0 |         2 |         2
-RRFF         |      1 |         9 |         8
-CCFF2        |      0 |         2 |         2
-CFCF2        |      1 |         3 |         2
-RFFF         |      0 |         2 |         2
-FFFF         |      0 |         4 |         4
-CFFF         |      0 |         5 |         5
-CRRF         |      0 |         3 |         3
-CFRR         |      0 |         3 |         3
-CRRR         |      0 |         3 |         3
-CRFR         |      0 |         4 |         4
--------------------------------------------------
-TOTAL LAND   |      4 |        72 |        68
-===============================================================================
-```
 
 ---
 
