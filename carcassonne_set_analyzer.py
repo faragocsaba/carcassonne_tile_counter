@@ -25,8 +25,10 @@ Workflow & Batch Processing Steps:
      output directory `extracted_tiles/carcassonne_bga_screenshot_2/`.
 
 3. Tile Cropping & Phase-Aligned Grid Alignment:
-   - Crops played tiles from screenshot and saves debug files
-     (`debug_clean_board_mask.png` and `grid_detection_preview.jpg`).
+   - Uses relative lightness offset (L <= wood_L - 12) to isolate BGA shaded slots
+     from brown city roofs (CCCCS tile).
+   - Applies geometric contour hole filling for solid tile interiors.
+   - Saves debug files (`debug_clean_board_mask.png` and `grid_detection_preview.jpg`).
 
 4. ResNet18 Tile Prediction & Categorization:
    - Classifies each 64x64px tile using the trained ResNet18 model.
@@ -152,21 +154,23 @@ def get_real_tile_mask(img):
     wood_lab = cv2.cvtColor(np.uint8([[median_wood_bgr]]), cv2.COLOR_BGR2LAB)[0, 0]
     
     dist_wood_3d = np.linalg.norm(img_lab.astype(np.float32) - wood_lab.astype(np.float32), axis=2)
-    is_pure_wood = dist_wood_3d < 28.0
+    is_pure_wood = dist_wood_3d < 16.0
     
     chroma_dist = np.sqrt((img_lab[:, :, 1].astype(np.float32) - wood_lab[1])**2 + (img_lab[:, :, 2].astype(np.float32) - wood_lab[2])**2)
     L_channel = img_lab[:, :, 0]
-    is_shaded_slot = (chroma_dist < 14.0) & (L_channel <= wood_lab[0] + 5)
+    is_shaded_slot = (chroma_dist < 12.0) & (L_channel <= wood_lab[0] - 12)
     
     is_bg = is_pure_wood | is_shaded_slot
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     
-    is_white_road = (S <= 35) & (V >= 180)
+    is_white_road = (S <= 35) & (V >= 170)
     is_green_field = (H >= 25) & (H <= 90) & (S >= 25) & (V >= 25)
-    is_black_meeple = (V < 25)
+    is_black_meeple = (V < 30)
+    is_blue_shield = (H >= 95) & (H <= 130) & (S >= 30) & (V >= 35)
+    is_red_roof = ((H <= 15) | (H >= 165)) & (S >= 40) & (V >= 50)
     
-    is_tile_pixel = (~is_bg) | is_white_road | is_green_field | is_black_meeple
+    is_tile_pixel = (~is_bg) | is_white_road | is_green_field | is_black_meeple | is_blue_shield | is_red_roof
     raw_mask = (is_tile_pixel.astype(np.uint8)) * 255
     
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -174,7 +178,15 @@ def get_real_tile_mask(img):
     
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
-    return clean_mask
+
+    # Geometric contour hole filling: fills hollow interiors of full-city tiles (CCCCS)
+    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled_mask = np.zeros_like(clean_mask)
+    for cnt in contours:
+        if cv2.contourArea(cnt) > 400:
+            cv2.drawContours(filled_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+
+    return filled_mask
 
 def find_optimal_grid_parameters(tile_mask):
     """
@@ -191,15 +203,14 @@ def find_optimal_grid_parameters(tile_mask):
 
     scores_by_S = {}
 
-    # 1. Expanded search pitch range for individual tiles (35px to 110px)
-    for S in range(35, 110):
+    # Expanded search pitch range for individual tiles (35px to 140px)
+    for S in range(35, 140):
         # Best x0 offset for candidate S
         best_x_score = -1
         best_x_offset = 0
         for x0 in range(S):
             x_indices = np.arange(x0, w, S)
             if len(x_indices) > 0:
-                # Use np.mean to prevent bias caused by varying number of grid lines
                 score_x = np.mean(v_proj[x_indices])
                 if score_x > best_x_score:
                     best_x_score = score_x
@@ -223,9 +234,8 @@ def find_optimal_grid_parameters(tile_mask):
     max_score = max(data[0] for data in scores_by_S.values())
 
     # 3. Fundamental frequency selection: choose smallest tile size S
-    # achieving at least 85% of the peak score.
-    # Prevents selecting 2x or 3x harmonic multiples.
-    candidate_S_list = [S for S, (score, _, _) in scores_by_S.items() if score >= 0.85 * max_score]
+    # achieving at least 70% of the peak score to reliably capture fundamental pitch.
+    candidate_S_list = [S for S, (score, _, _) in scores_by_S.items() if score >= 0.70 * max_score]
     best_S = min(candidate_S_list)
     
     _, best_x0, best_y0 = scores_by_S[best_S]
@@ -305,8 +315,6 @@ def build_report_text(image_filename, played_counts):
     # Iterate based on the original set composition order
     for tile_code, original_count in ORIGINAL_SET_COMPOSITION.items():
         played_count = played_counts.get(tile_code, 0)
-        
-        # In case prediction finds a tile not in the canonical set (should not happen with good model)
         remaining_count = original_count - played_count
 
         total_played += played_count
