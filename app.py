@@ -25,15 +25,17 @@ Workflow & Processing Architecture:
      `fcsaba/carcassonne-resnet18-tile-classifier`.
 
 2. Computer Vision Preprocessing & Masking:
-   - Uses relative lightness offset (L <= wood_L - 12) to cleanly isolate BGA shaded
-     slots from wood background without capturing brown city roofs (CCCCS tile).
+   - Uses relative lightness and saturation thresholding in HSV/Lab space to cleanly
+     isolate BGA shaded slots and wood background.
    - Applies geometric contour hole filling for solid tile interiors.
-   - Calculates Canny boundary edge projections across expanded S pitch (35px-140px)
-     and 0.70 candidate threshold to fit fundamental grid pitch.
+   - Calculates 1D autocorrelation across horizontal and vertical Canny edge projections
+     to accurately determine fundamental grid pitch S (preventing 0.5x / 2x pitch errors).
 
-3. Deep Learning Tile Inference:
-   - Slices valid grid cells (> 50% mask coverage), resizes cropped tiles to 64x64px,
-     and evaluates them with ResNet18 neural network across 24 tile categories.
+3. Deep Learning Tile Inference & Background Filtering:
+   - Evaluates tile crops; filters out boundary crops where background/shaded pixels
+     exceed 45% ratio.
+   - Slices valid tiles, resizes cropped tiles to 64x64px, and evaluates them with
+     ResNet18 neural network across 24 tile categories.
 
 4. Browser Extension-Style Visual Grid Export:
    - Displays real-time remaining tile counts in a visual card grid layout with high-contrast
@@ -229,11 +231,7 @@ def build_html_report(played_counts):
 # Computer Vision Pipeline Helpers (Masking & Grid Alignment)
 # ==============================================================================
 def get_real_tile_mask(img):
-    """
-    Creates a binary mask isolating played tiles from wood and shaded slots.
-    Uses relative lightness thresholding (L <= wood_L - 12) to isolate shaded slots
-    from wood, while explicitly protecting red roofs and city elements.
-    """
+    """Creates a binary mask isolating played tiles from wood and shaded slots."""
     h, w, _ = img.shape
     corner_size = 30
     top_left = img[0:corner_size, 0:corner_size]
@@ -246,33 +244,37 @@ def get_real_tile_mask(img):
         bottom_left.reshape(-1, 3),
         bottom_right.reshape(-1, 3)
     ])
-    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    
+    # 1. Determine baseline color and brightness values of the wood background
     median_wood_bgr = np.median(corner_pixels, axis=0).astype(np.uint8)
+    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     wood_lab = cv2.cvtColor(np.uint8([[median_wood_bgr]]), cv2.COLOR_BGR2LAB)[0, 0]
     
-    dist_wood_3d = np.linalg.norm(img_lab.astype(np.float32) - wood_lab.astype(np.float32), axis=2)
-    is_pure_wood = dist_wood_3d < 16.0
-    
-    chroma_dist = np.sqrt(
-        (img_lab[:, :, 1].astype(np.float32) - wood_lab[1])**2 + 
-        (img_lab[:, :, 2].astype(np.float32) - wood_lab[2])**2
-    )
-    L_channel = img_lab[:, :, 0]
-    
-    # Shaded placement slots: Same chrominance as wood, but darker (L <= wood_L - 12)
-    is_shaded_slot = (chroma_dist < 12.0) & (L_channel <= wood_lab[0] - 12)
-    
-    is_bg = is_pure_wood | is_shaded_slot
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    wood_hsv = cv2.cvtColor(np.uint8([[median_wood_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
     H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    
-    is_white_road = (S <= 35) & (V >= 170)
+
+    # Detect pure wood background based on Lab color distance
+    dist_wood_3d = np.linalg.norm(img_lab.astype(np.float32) - wood_lab.astype(np.float32), axis=2)
+    is_pure_wood = dist_wood_3d < 18.0
+
+    # 2. Detect BGA shaded slots based on relative color and brightness
+    wood_v = wood_hsv[2]
+    is_shaded_slot = (V < (wood_v * 0.75)) & (S < 110) & (V > 25)
+
+    is_bg = is_pure_wood | is_shaded_slot
+
+    # 3. Detect characteristic tile features
+    is_white_road = (S <= 35) & (V >= 160)
     is_green_field = (H >= 25) & (H <= 90) & (S >= 25) & (V >= 25)
-    is_black_meeple = (V < 30)
     is_blue_shield = (H >= 95) & (H <= 130) & (S >= 30) & (V >= 35)
     is_red_roof = ((H <= 15) | (H >= 165)) & (S >= 40) & (V >= 50)
+    is_black_meeple = (V < 25) & (S < 40)
+
+    # Determine tile pixels: non-background OR matched features,
+    # strictly excluding shaded slots (~is_shaded_slot)
+    is_tile_pixel = ((~is_bg) | is_white_road | is_green_field | is_blue_shield | is_red_roof | is_black_meeple) & (~is_shaded_slot)
     
-    is_tile_pixel = (~is_bg) | is_white_road | is_green_field | is_black_meeple | is_blue_shield | is_red_roof
     raw_mask = (is_tile_pixel.astype(np.uint8)) * 255
     
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -281,7 +283,7 @@ def get_real_tile_mask(img):
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
 
-    # Geometric contour hole filling: fills hollow interiors of full-city tiles (CCCCS)
+    # Fill geometric contour holes (for interior hollows of full-city CCCCS tiles)
     contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled_mask = np.zeros_like(clean_mask)
     for cnt in contours:
@@ -293,19 +295,59 @@ def get_real_tile_mask(img):
 def find_optimal_grid_parameters(tile_mask):
     """
     Optimizes 2D grid parameters (Tile Size S, Offset x0, Offset y0)
-    by aligning grid lines with the outer boundary edges of played tiles.
-    Search pitch range (35px to 140px) handles all screenshot zoom resolutions.
+    using 1D autocorrelation to identify the fundamental tile pitch S,
+    preventing harmonic sub/super-multiple errors (e.g., 0.5x or 2x tile size).
     """
     h, w = tile_mask.shape
     
     mask_edges = cv2.Canny(tile_mask, 100, 200)
+    mask_edges_smooth = cv2.GaussianBlur(mask_edges.astype(np.float32), (5, 5), 0)
     
-    v_proj = np.sum(mask_edges, axis=0)
-    h_proj = np.sum(mask_edges, axis=1)
+    v_proj = np.sum(mask_edges_smooth, axis=0)
+    h_proj = np.sum(mask_edges_smooth, axis=1)
 
-    scores_by_S = {}
+    min_s, max_s = 35, 140
 
-    for S in range(35, 140):
+    # 1. Calculate 1D autocorrelation to measure periodic pitch
+    def autocorr1d(arr):
+        p = arr - np.mean(arr)
+        std = np.std(p)
+        if std == 0:
+            return np.zeros(max_s)
+        n = len(p)
+        ac = np.zeros(max_s)
+        for lag in range(min_s, min(max_s, n)):
+            ac[lag] = np.sum(p[:n - lag] * p[lag:]) / (n - lag)
+        return ac
+
+    ac_v = autocorr1d(v_proj)
+    ac_h = autocorr1d(h_proj)
+    combined_ac = ac_v + ac_h
+
+    # 2. Find the fundamental tile size S (first prominent autocorrelation peak)
+    max_val = np.max(combined_ac[min_s:max_s]) if np.max(combined_ac[min_s:max_s]) > 0 else 1.0
+    
+    candidate_peaks = []
+    for lag in range(min_s + 1, max_s - 1):
+        if combined_ac[lag] >= combined_ac[lag - 1] and combined_ac[lag] >= combined_ac[lag + 1]:
+            if combined_ac[lag] >= 0.45 * max_val:
+                candidate_peaks.append(lag)
+
+    if candidate_peaks:
+        S_fundamental = candidate_peaks[0]
+    else:
+        S_fundamental = min_s + np.argmax(combined_ac[min_s:max_s])
+
+    # 3. Fine-tune S, x0, and y0 in a tight window around S_fundamental
+    best_score = -1
+    best_S = S_fundamental
+    best_x0 = 0
+    best_y0 = 0
+
+    search_start = max(min_s, S_fundamental - 3)
+    search_end = min(max_s, S_fundamental + 4)
+
+    for S in range(search_start, search_end):
         best_x_score = -1
         best_x_offset = 0
         for x0 in range(S):
@@ -327,14 +369,11 @@ def find_optimal_grid_parameters(tile_mask):
                     best_y_offset = y0
 
         total_score = best_x_score + best_y_score
-        scores_by_S[S] = (total_score, best_x_offset, best_y_offset)
-
-    max_score = max(data[0] for data in scores_by_S.values())
-
-    candidate_S_list = [S for S, (score, _, _) in scores_by_S.items() if score >= 0.70 * max_score]
-    best_S = min(candidate_S_list)
-    
-    _, best_x0, best_y0 = scores_by_S[best_S]
+        if total_score > best_score:
+            best_score = total_score
+            best_S = S
+            best_x0 = best_x_offset
+            best_y0 = best_y_offset
 
     return best_S, best_x0, best_y0
 
@@ -368,6 +407,22 @@ def analyze_carcassonne_board(image_path):
     row_start = int(np.floor((min_y - y0) / tile_size))
     row_end = int(np.ceil((max_y - y0) / tile_size))
     
+    # Calculate baseline background color profile for crop-level filtering
+    corner_size = 30
+    top_left = img_cv2[0:corner_size, 0:corner_size]
+    top_right = img_cv2[0:corner_size, width - corner_size:width]
+    bottom_left = img_cv2[height - corner_size:height, 0:corner_size]
+    bottom_right = img_cv2[height - corner_size:height, width - corner_size:width]
+    corner_pixels = np.vstack([
+        top_left.reshape(-1, 3), 
+        top_right.reshape(-1, 3), 
+        bottom_left.reshape(-1, 3), 
+        bottom_right.reshape(-1, 3)
+    ])
+    median_wood_bgr = np.median(corner_pixels, axis=0).astype(np.uint8)
+    wood_lab = cv2.cvtColor(np.uint8([[median_wood_bgr]]), cv2.COLOR_BGR2LAB)[0, 0]
+    wood_hsv = cv2.cvtColor(np.uint8([[median_wood_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
+
     pil_img_src = Image.open(image_path)
     played_counts = Counter()
     
@@ -389,6 +444,25 @@ def analyze_carcassonne_board(image_path):
             
             fill_ratio = np.sum(cell_mask > 0) / cell_mask.size
             if fill_ratio > 0.50:
+                crop_cv2 = img_cv2[y1:y2, x1:x2]
+                
+                # Check background ratio directly inside the cropped tile box
+                crop_lab = cv2.cvtColor(crop_cv2, cv2.COLOR_BGR2LAB)
+                crop_hsv = cv2.cvtColor(crop_cv2, cv2.COLOR_BGR2HSV)
+                
+                dist_wood = np.linalg.norm(crop_lab.astype(np.float32) - wood_lab.astype(np.float32), axis=2)
+                is_wood_px = dist_wood < 22.0
+                
+                V_crop = crop_hsv[:, :, 2]
+                S_crop = crop_hsv[:, :, 1]
+                is_shaded_px = (V_crop < (wood_hsv[2] * 0.80)) & (S_crop < 110) & (V_crop > 20)
+                
+                bg_pixel_ratio = np.mean(is_wood_px | is_shaded_px)
+                
+                # Discard crops where background/shaded pixels dominate (> 45%)
+                if bg_pixel_ratio > 0.45:
+                    continue
+
                 crop_box = (x1, y1, x2, y2)
                 tile_crop = pil_img_src.crop(crop_box).resize(IMAGE_SIZE, Image.Resampling.LANCZOS)
                 
